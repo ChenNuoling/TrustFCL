@@ -1,0 +1,224 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import time
+from utils import get_memory_usage
+
+
+
+class Client:
+    def __init__(self, cid, args, model, data_loader, task_sequence):
+        self.cid = cid
+        self.args = args
+        self.model = model.to(args.device)
+        self.data_generator = data_loader
+        self.task_sequence = task_sequence
+        self.per_task_class_num = args.num_classes // args.num_tasks
+
+    def _map_global_to_local_label(self, global_label, actual_task_id):
+        return global_label - actual_task_id * self.per_task_class_num
+    def set_weights(self, global_weights):
+        """同步全局权重"""
+        if global_weights is not None:
+            self.model.load_state_dict(global_weights)
+
+    def _get_adversarial_x(self, x, y, task_id,attack_name=None,steps=None):
+        """
+        统一攻击入口：显式分支判断 
+        """
+        name = attack_name if attack_name else self.args.attack
+
+        # 根据名字显式调用 
+        if name == 'pgd':
+            return self.pgd(x, y, task_id,steps=steps)
+        elif name == 'fgsm':
+            return self.fgsm(x, y,task_id)
+        else:
+            raise ValueError(f"Unsupported attack: {name}")
+
+
+    def fgsm(self, x, y,task_id):
+        """Fast Gradient Sign Method (FGSM)"""
+        training_mode = self.model.training
+        self.model.eval()
+        x_adv = x.clone().detach().requires_grad_(True)
+        outputs = self.model(x_adv,task_id)
+        loss = F.cross_entropy(outputs, y)
+        grad = torch.autograd.grad(loss, x_adv)[0]
+        x_adv = x_adv + self.args.fgsm_eps * grad.sign()
+        self.model.train(training_mode)
+        return torch.clamp(x_adv, 0, 1).detach()
+    
+    def pgd(self, x, y, task_id,steps=None):
+        """Projected Gradient Descent (PGD)"""
+        training_mode = self.model.training
+        self.model.eval()
+
+        # 确定迭代步数：默认使用测试步数，除非显式指定（如训练时）
+        _steps = steps if steps is not None else self.args.pgd_steps
+
+        x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-self.args.pgd_eps, self.args.pgd_eps)
+        x_adv = torch.clamp(x_adv, 0, 1).detach()
+
+        for _ in range(_steps):
+            x_adv.requires_grad_(True)
+            outputs = self.model(x_adv,task_id)
+            loss = F.cross_entropy(outputs, y)
+            grad = torch.autograd.grad(loss, x_adv)[0]
+            with torch.no_grad():
+                x_adv = x_adv + self.args.pgd_alpha * grad.sign()
+                delta = torch.clamp(x_adv - x, -self.args.pgd_eps, self.args.pgd_eps)
+                x_adv = torch.clamp(x + delta, 0, 1).detach()
+
+        self.model.train(training_mode)
+        return x_adv
+
+
+    def train_main_task(self, seq_idx, global_weights):
+        """标准本地训练 (Clean Training)"""
+        actual_task_id = self.task_sequence[seq_idx]
+        self.set_weights(global_weights)
+
+        loader, classes = self.data_generator.get_loader(self.cid, actual_task_id, 'train')
+
+        optimizer = optim.Adam(self.model.parameters(), lr=self.args.lr)
+        criterion = nn.CrossEntropyLoss()
+
+        self.model.train()
+        epoch_loss, total_correct, total_samples = 0, 0, 0
+
+        mem_start = get_memory_usage() if self.args.record_memory else 0
+        mem_peak = mem_start
+        start_time = time.time()
+
+        for epoch in range(self.args.local_epochs):
+            for x, y in loader:
+                if x.size(0)==1:
+                    continue
+                x, y = x.to(self.args.device), y.to(self.args.device)
+                y_map = self._map_global_to_local_label(y, actual_task_id)
+
+                optimizer.zero_grad()
+                outputs = self.model(x, actual_task_id)
+                loss = criterion(outputs, y_map)
+                loss.backward()
+                optimizer.step()
+
+                if self.args.record_memory:
+                    current_mem = get_memory_usage()
+                    if current_mem > mem_peak:
+                        mem_peak = current_mem
+
+                with torch.no_grad():
+                    total_correct += (outputs.argmax(dim=1) == y_map).sum().item()
+                    total_samples += y.size(0)
+                    epoch_loss += loss.item()
+
+        training_time = time.time() - start_time
+        mem_end = get_memory_usage() if self.args.record_memory else 0
+
+        return self.model.state_dict(), epoch_loss / total_samples, total_correct / total_samples, training_time, mem_start, mem_peak, mem_end
+
+    def fat_train_main_task(self, seq_idx, global_weights, kn_ratio):
+        """
+        FAT 对抗训练 (Local Adversarial Training with Dynamic Ratio)
+        每个小批量中前 K 个为对抗样本，其余为干净样本
+        K = int(batch_size * kn_ratio)
+        """
+        actual_task_id = self.task_sequence[seq_idx]
+        self.set_weights(global_weights)
+
+        loader, classes = self.data_generator.get_loader(self.cid, actual_task_id, 'train')
+        label_map = {g: l for l, g in enumerate(classes)}
+
+        optimizer = optim.Adam(self.model.parameters(), lr=self.args.lr)
+        criterion = nn.CrossEntropyLoss()
+
+        self.model.train()
+        epoch_loss, total_correct, total_samples = 0, 0, 0
+
+        mem_start = get_memory_usage() if self.args.record_memory else 0
+        mem_peak = mem_start
+        start_time = time.time()
+
+        for epoch in range(self.args.local_epochs):
+            for x, y in loader:
+                if x.size(0)==1:
+                    continue
+                x, y = x.to(self.args.device), y.to(self.args.device)
+                y_map = self._map_global_to_local_label(y, actual_task_id)
+
+                batch_size = x.size(0)
+                k = int(batch_size * kn_ratio)
+
+                if k > 0 and k < batch_size:
+                    x_adv_part = self._get_adversarial_x(x[:k], y_map[:k], seq_idx,
+                                                          attack_name='pgd',
+                                                          steps=self.args.pgd_steps)
+                    x_mixed = torch.cat([x_adv_part, x[k:]], dim=0)
+                elif k >= batch_size:
+                    x_mixed = self._get_adversarial_x(x, y_map, seq_idx,
+                                                      attack_name='pgd',
+                                                      steps=self.args.pgd_steps)
+                else:
+                    x_mixed = x
+
+                optimizer.zero_grad()
+                self.model.train()
+                outputs = self.model(x_mixed, seq_idx)
+                loss = criterion(outputs, y_map)
+                loss.backward()
+                optimizer.step()
+
+                if self.args.record_memory:
+                    current_mem = get_memory_usage()
+                    if current_mem > mem_peak:
+                        mem_peak = current_mem
+
+                with torch.no_grad():
+                    total_correct += (outputs.argmax(dim=1) == y_map).sum().item()
+                    total_samples += y.size(0)
+                    epoch_loss += loss.item()
+
+        training_time = time.time() - start_time
+        mem_end = get_memory_usage() if self.args.record_memory else 0
+
+        return self.model.state_dict(), epoch_loss / total_samples, total_correct / total_samples, training_time, mem_start, mem_peak, mem_end
+
+    def extensive_test(self, curr_round):
+        """全面测试：评估 Clean 和 Robust 准确率"""
+        max_seq_idx = min(curr_round // self.args.t_round, self.args.num_tasks - 1)
+        results = {'clean': [], 'robust': []}
+
+        self.model.eval()
+        for s_idx in range(max_seq_idx + 1):
+            actual_task_id = self.task_sequence[s_idx]
+            loader, classes = self.data_generator.get_loader(self.cid, actual_task_id, 'test')
+            label_map = {g: l for l, g in enumerate(classes)}
+
+            correct_clean, correct_adv, total = 0, 0, 0
+
+            for x, y in loader:
+                if x.size(0)==1:
+                    continue
+                x, y = x.to(self.args.device), y.to(self.args.device)
+                y_map = self._map_global_to_local_label(y, actual_task_id)
+
+                with torch.no_grad():
+                    out_clean = self.model(x, s_idx)
+                    correct_clean += (out_clean.argmax(1) == y_map).sum().item()
+
+                # 测试时根据 args.attack 动态生成对抗样本
+                x_adv = self._get_adversarial_x(x, y_map, s_idx,steps=self.args.pgd_test)
+
+                with torch.no_grad():
+                    out_adv = self.model(x_adv, s_idx)
+                    correct_adv += (out_adv.argmax(1) == y_map).sum().item()
+
+                total += x.size(0)
+
+            results['clean'].append(correct_clean / total if total > 0 else 0)
+            results['robust'].append(correct_adv / total if total > 0 else 0)
+
+        return results
