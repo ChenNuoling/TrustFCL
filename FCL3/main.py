@@ -17,20 +17,6 @@ Naive Federated Continual Learning (FCL) 流程
 增强：每个客户端拥有独立的随机任务序列，模拟更复杂的异构持续学习场景。
 
 
-2026/6/4  15:05:05
-添加和测试不同模型和数据集（明日）
-    模型：CNN、ResNet18、vit_small_patch16_224、Mobilenet
-    数据集：mnist、cifar10、cifar100
-
-
-5/18 14:30更新FL_Avg_ex\FCL\FCL_base
-核心逻辑：
-- 全局任务ID (task_idx_in_seq): 当前训练的第几个任务，所有客户端相同，用于选择分类器分支
-- 本地真实任务ID (actual_task_id): 数据集中对应的真实任务ID，各客户端不同，用于标签映射
-
-client.py: 将全局标签映射为本地标签，映射公式：local_label = global_label - actual_task_id * per_task_class_num
-net.py: 根据全局任务ID选择分类器分支范围，例如全局任务ID为2，选择[per_task_class_num*2:per_task_class_num*3)范围
-
 示例：
 - 全局任务ID=2，客户端1训练任务4（标签范围[30,40)），映射后标签范围[0,10)，模型选择[20,30)分支
 - 全局任务ID=2，客户端2训练任务9（标签范围[80,90)），映射后标签范围[0,10)，模型选择[20,30)分支
