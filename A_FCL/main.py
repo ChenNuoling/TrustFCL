@@ -1,0 +1,192 @@
+from utils import Args, set_seed, get_model_param_size, LogPrinter, Recorder
+from nets import Init_model
+from data_loader import TaskGenerator
+from client import Client
+from server import Server
+import numpy as np
+import copy
+import time
+import torch
+import os
+import json
+from datetime import datetime
+
+"""
+Naive Federated Continual Learning (FCL) 流程
+特征：标准 FedAvg + 顺序任务学习，没有任何遗忘缓解机制 (No FedWeIT, No EWC, No Replay)
+增强：每个客户端拥有独立的随机任务序列，模拟更复杂的异构持续学习场景。
+
+2026/6/10 19:00
+添加相同位置相同任务的最小客户端比例约束和最大客户端比例约束（未测试）
+
+
+2026/6/4  15:05:05
+添加和测试不同模型和数据集（明日）
+    模型：CNN、ResNet18、vit_small_patch16_224、Mobilenet
+    数据集：mnist、cifar10、cifar100
+
+
+5/18 14:30更新FL_Avg_ex\FCL\FCL_base
+核心逻辑：
+- 全局任务ID (task_idx_in_seq): 当前训练的第几个任务，所有客户端相同，用于选择分类器分支
+- 本地真实任务ID (actual_task_id): 数据集中对应的真实任务ID，各客户端不同，用于标签映射
+
+client.py: 将全局标签映射为本地标签，映射公式：local_label = global_label - actual_task_id * per_task_class_num
+net.py: 根据全局任务ID选择分类器分支范围，例如全局任务ID为2，选择[per_task_class_num*2:per_task_class_num*3)范围
+
+示例：
+- 全局任务ID=2，客户端1训练任务4（标签范围[30,40)），映射后标签范围[0,10)，模型选择[20,30)分支
+- 全局任务ID=2，客户端2训练任务9（标签范围[80,90)），映射后标签范围[0,10)，模型选择[20,30)分支
+
+
+"""
+
+
+def main():
+    args = Args()
+    set_seed(args.seed)
+
+    now = datetime.now()
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_dir = os.path.join(script_dir, f"outputs/{args.model}_{args.dataset}/{now.strftime('%Y-%m-%d')}")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    params_str = f"clients{args.num_clients}_tround{args.t_round}_tasks{args.num_tasks}_alpha{args.dirichlet_alpha}_batch{args.batch_size}_lr{args.lr}_epochs{args.local_epochs}_{now.strftime('%H%M%S')}"
+    log_file = os.path.join(output_dir, f'{params_str}_log.txt')
+    
+    log_print = LogPrinter(log_file)
+
+    log_print(f"Output directory: {output_dir}")
+    log_print(f"Log file: {log_file}")
+    log_print("Initializing Plain FCL components with Randomized Task Sequences...")
+    task_gen = TaskGenerator(args)
+
+    dummy_model = Init_model(args)
+    server = Server(args)
+    global_weights = copy.deepcopy(dummy_model.state_dict())
+
+    all_task_ids = list(range(args.num_tasks))
+    client_task_sequences = [np.random.permutation(all_task_ids).tolist() for _ in range(args.num_clients)]
+    log_print(f"Client task sequences: {client_task_sequences}")
+    clients = [
+        Client(i, args, copy.deepcopy(dummy_model), task_gen, task_sequence=client_task_sequences[i])
+        for i in range(args.num_clients)
+    ]
+
+    log_print("=== Federated Continual Learning (Randomized Sequences) ===")
+
+    total_start_time = time.time()
+    round_acc_clean = []
+    
+    all_attacks_list = ['pgd', 'fgsm', 'jsma', 'deepfool', 'autoattack']
+    if args.attack == 'all':
+        attacks_to_test = all_attacks_list
+    elif args.attack in all_attacks_list:
+        attacks_to_test = [args.attack]
+    else:
+        attacks_to_test = ['pgd']
+    
+    round_acc_attacks = {attack: [] for attack in attacks_to_test}
+
+    prev_global_task_id = -1
+
+    comm_cost_per_round = get_model_param_size(global_weights) * 2
+    recorder = Recorder(log_print, args, comm_cost_per_round)
+
+    for rnd in range(args.num_rounds):
+        recorder.output_round_start(rnd)
+
+        global_task_id = min(rnd // args.t_round, args.num_tasks - 1)
+
+        if global_task_id != prev_global_task_id and prev_global_task_id >= 0:
+            recorder.output_task_switch(prev_global_task_id, global_task_id)
+        prev_global_task_id = global_task_id
+
+        log_print("  > Step 1: Standard Local Training")
+        reports = []
+        client_train_times = []
+        client_mem_peaks = []
+        client_mem_ends = []
+
+        for client in clients:
+            rep, loss, train_acc, train_time, mem_start, mem_peak, mem_end = client.pgd_train_main_task(global_task_id, global_weights)
+            reports.append(rep)
+            client_train_times.append(train_time)
+            client_mem_peaks.append(mem_peak)
+            client_mem_ends.append(mem_end)
+            recorder.output_client_train(client.cid, client.task_sequence[global_task_id], loss, train_acc, train_time)
+
+        global_weights, agg_time, mem_start, mem_end = server.aggregate(reports)
+        recorder.output_server_agg(agg_time)
+
+        if args.record_memory:
+            recorder.update_memory_stats(np.max(client_mem_peaks), np.mean(client_mem_ends), mem_end, mem_end)
+        recorder.update_time_stats(np.sum(client_train_times), agg_time)
+
+        log_print("  > Step 3: Evaluation Across All Learned Tasks")
+
+        # 最后一轮测试所有攻击，其他轮次测试 args.attack 指定的攻击
+        if rnd == args.num_rounds - 1:
+            attacks = ['pgd', 'fgsm', 'jsma', 'deepfool', 'autoattack']
+        else:
+            if args.attack in ['pgd', 'fgsm', 'jsma', 'deepfool','autoattack']:
+                attacks = [args.attack]
+            else:
+                attacks = ['pgd']
+        
+        all_results = {'clean': []}
+        for attack in attacks:
+            all_results[attack] = []
+        
+        per_task_results = {'clean': [[] for _ in range(global_task_id + 1)]}
+        for attack in attacks:
+            per_task_results[attack] = [[] for _ in range(global_task_id + 1)]
+
+        for client in clients:
+            client.set_weights(global_weights)
+            res = client.extensive_test(rnd)
+            all_results['clean'].append(np.mean(res['clean']))
+            for attack in attacks:
+                all_results[attack].append(np.mean(res[attack]))
+            
+            for tid in range(len(res['clean'])):
+                per_task_results['clean'][tid].append(res['clean'][tid])
+                for attack in attacks:
+                    per_task_results[attack][tid].append(res[attack][tid])
+
+            recorder.output_client_eval(client.cid, res)
+            if 'pgd' in attacks:
+                recorder.check_comm_cost_target(global_task_id, res['pgd'][global_task_id], rnd)
+            recorder.record_task_accuracy(global_task_id, 
+            [np.mean(per_task_results['clean'][tid]) for tid in range(global_task_id + 1)],
+            [np.mean(per_task_results[attacks[0]][tid]) for tid in range(global_task_id + 1)])
+
+        round_acc_clean.append(np.mean(all_results['clean']))
+        for attack in attacks:
+            round_acc_attacks[attack].append(np.mean(all_results[attack]))
+        
+        log_print(f"\n  >> Round {rnd + 1} Attack Robustness Summary:")
+        log_print(f"     Clean Accuracy: {np.mean(all_results['clean']):.4f}")
+        for attack in attacks:
+            log_print(f"     {attack.upper()} Robust Accuracy: {np.mean(all_results[attack]):.4f}")
+
+    total_cost = time.time() - total_start_time
+    
+    log_print("\n" + "="*60)
+    log_print("[Final Attack Robustness Summary]")
+    log_print("="*60)
+    log_print(f"Clean Accuracy per Round: {[f'{a:.4f}' for a in round_acc_clean]}")
+    for attack in attacks_to_test:
+        log_print(f"{attack.upper()} Robust Accuracy per Round: {[f'{a:.4f}' for a in round_acc_attacks[attack]]}")
+    
+    log_print(f"\nAverage Clean Accuracy: {np.mean(round_acc_clean):.4f}")
+    for attack in attacks_to_test:
+        log_print(f"Average {attack.upper()} Robust Accuracy: {np.mean(round_acc_attacks[attack]):.4f}")
+    
+    log_print("="*60)
+    
+    recorder.output_summary(round_acc_clean, round_acc_attacks[attacks[0]], global_task_id, total_cost, output_dir)
+
+
+if __name__ == '__main__':
+    main()
